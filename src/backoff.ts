@@ -107,12 +107,18 @@ export function extractRetryAfter(error: unknown): number | null {
     return null
   }
 
-  const seconds = Number(headerValue)
+  const trimmedHeaderValue = headerValue.trim()
+  const isNumericDelay = /^\d+(\.\d+)?$/.test(trimmedHeaderValue)
+  const seconds = Number(trimmedHeaderValue)
   if (Number.isFinite(seconds)) {
     return seconds * 1000
   }
 
-  const dateMs = Date.parse(headerValue)
+  if (isNumericDelay) {
+    return null
+  }
+
+  const dateMs = Date.parse(trimmedHeaderValue)
   if (Number.isFinite(dateMs)) {
     return Math.max(dateMs - Date.now(), 0)
   }
