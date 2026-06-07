@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { extractRetryAfter, isRetryableError } from '../src/backoff.js'
 import { CircuitBreaker } from '../src/circuit-breaker.js'
+import { GlobalBudgetTracker } from '../src/global-budget.js'
+import { AdaptiveHedgeDelay } from '../src/hedging.js'
 import { LLMRetryError, llmRetry } from '../src/retry.js'
 import { llmRetryStream } from '../src/stream.js'
 
@@ -281,6 +283,19 @@ describe('llmRetry budget and cancellation', () => {
     ).rejects.toThrow(LLMRetryError)
   })
 
+  it('preserves abort failures after the retry loop stops', async () => {
+    await expect(
+      llmRetry({
+        fn: () => new Promise<never>(() => undefined),
+        timeoutMs: 1,
+        initialDelayMs: 0,
+      })
+    ).rejects.toMatchObject({
+      reason: 'aborted',
+      primaryError: expect.objectContaining({ name: 'AbortError' }),
+    })
+  })
+
   it('uses provider-specific timeout before falling back', async () => {
     const primary = vi.fn(() => new Promise<never>(() => undefined))
     const fallback = vi.fn().mockResolvedValue(mockResponse('fallback ok'))
@@ -356,6 +371,109 @@ describe('llmRetry resilience controls', () => {
     expect(result.provider).toBe('hedge')
     expect(result.attempts).toBe(2)
     expect(primaryAborted).toBe(true)
+  })
+
+  it('records circuit breaker failures for both failed hedged providers', async () => {
+    const primaryBreaker = new CircuitBreaker({
+      failureThreshold: 1,
+      windowMs: 1000,
+      cooldownMs: 1000,
+    })
+    const hedgeBreaker = new CircuitBreaker({
+      failureThreshold: 1,
+      windowMs: 1000,
+      cooldownMs: 1000,
+    })
+    const primary = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      setTimeout(() => reject(Object.assign(new Error('primary overloaded'), { status: 529 })), 10)
+    }))
+    const hedge = vi.fn().mockRejectedValue(Object.assign(new Error('hedge overloaded'), {
+      status: 529,
+    }))
+
+    await expect(
+      llmRetry({
+        providers: [
+          { name: 'primary', fn: primary, maxRetries: 0, circuitBreaker: primaryBreaker },
+          { name: 'hedge', fn: hedge, maxRetries: 0, circuitBreaker: hedgeBreaker },
+        ],
+        hedgeDelayMs: 1,
+      })
+    ).rejects.toThrow(LLMRetryError)
+
+    expect(primaryBreaker.snapshot()).toMatchObject({ state: 'open', failures: 1 })
+    expect(hedgeBreaker.snapshot()).toMatchObject({ state: 'open', failures: 1 })
+  })
+
+  it('supports adaptive hedging from recorded provider latency', async () => {
+    const adaptiveHedge = new AdaptiveHedgeDelay({
+      minSamples: 1,
+      sampleSize: 10,
+    })
+    adaptiveHedge.recordLatency({
+      provider: 'primary',
+      providerIndex: 0,
+      latencyMs: 1,
+      outcome: 'success',
+      hedged: false,
+    })
+
+    let primaryAborted = false
+    const primary = vi.fn((context) => {
+      context.signal?.addEventListener('abort', () => {
+        primaryAborted = true
+      })
+
+      return new Promise((resolve) => {
+        setTimeout(() => resolve(mockResponse('slow primary')), 50)
+      })
+    })
+    const hedge = vi.fn().mockResolvedValue(mockResponse('adaptive hedge'))
+
+    const result = await llmRetry({
+      providers: [
+        { name: 'primary', fn: primary, maxRetries: 0 },
+        { name: 'hedge', fn: hedge, maxRetries: 0 },
+      ],
+      hedgeDelayStrategy: adaptiveHedge,
+    })
+
+    expect(result.data).toBe('adaptive hedge')
+    expect(result.provider).toBe('hedge')
+    expect(result.attempts).toBe(2)
+    expect(primaryAborted).toBe(true)
+  })
+})
+
+describe('llmRetry global budget', () => {
+  it('blocks new calls when the rolling budget is exhausted', async () => {
+    const globalBudget = new GlobalBudgetTracker({
+      maxCostUSD: 0.01,
+      windowMs: 60_000,
+    })
+    const first = vi.fn().mockResolvedValue(mockResponse('first', 10_000))
+    const second = vi.fn().mockResolvedValue(mockResponse('second'))
+
+    const result = await llmRetry({
+      fn: first,
+      costPer1kTokens: 0.002,
+      globalBudget,
+    })
+
+    expect(result.data).toBe('first')
+    expect(globalBudget.spent).toBe(0.02)
+
+    await expect(
+      llmRetry({
+        fn: second,
+        globalBudget,
+      })
+    ).rejects.toMatchObject({
+      reason: 'budget_exceeded',
+      attempts: 0,
+    })
+
+    expect(second).not.toHaveBeenCalled()
   })
 })
 
@@ -449,6 +567,96 @@ describe('llmRetryStream', () => {
 
     expect(chunks).toEqual(['first'])
     expect(fallback).not.toHaveBeenCalled()
+  })
+
+  it('preserves abort failures when a stream stops before fallback', async () => {
+    const result = llmRetryStream({
+      stream: () => (async function* () {
+        const error = new Error('The operation was aborted')
+        error.name = 'AbortError'
+        throw error
+      })(),
+      maxRetries: 1,
+      initialDelayMs: 0,
+    })
+
+    await expect(async () => {
+      for await (const _chunk of result.stream) {
+        // consume the stream
+      }
+    }).rejects.toMatchObject({
+      reason: 'aborted',
+      primaryError: expect.objectContaining({ name: 'AbortError' }),
+    })
+  })
+
+  it('awaits async onChunk hooks before yielding chunks', async () => {
+    const order: string[] = []
+    const result = llmRetryStream({
+      stream: () => (async function* () {
+        yield 'a'
+      })(),
+      onChunk: async (chunk) => {
+        await new Promise((resolve) => setTimeout(resolve, 1))
+        order.push(`hook:${chunk}`)
+      },
+    })
+
+    for await (const chunk of result.stream) {
+      order.push(`yield:${chunk}`)
+    }
+
+    expect(order).toEqual(['hook:a', 'yield:a'])
+  })
+
+  it('does not break the stream when async onChunk fails by default', async () => {
+    const onChunkError = vi.fn()
+    const result = llmRetryStream({
+      stream: () => (async function* () {
+        yield 'a'
+      })(),
+      onChunk: async () => {
+        throw new Error('redis write failed')
+      },
+      onChunkError,
+    })
+    const chunks: string[] = []
+
+    for await (const chunk of result.stream) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks).toEqual(['a'])
+    expect(onChunkError).toHaveBeenCalledWith(
+      expect.any(Error),
+      'a',
+      expect.objectContaining({ provider: 'primary' })
+    )
+  })
+
+  it('blocks streams when the rolling budget is exhausted', async () => {
+    const globalBudget = new GlobalBudgetTracker({
+      maxCostUSD: 0,
+      windowMs: 60_000,
+    })
+    const stream = vi.fn(async function* () {
+      yield 'blocked'
+    })
+    const result = llmRetryStream({
+      stream,
+      globalBudget,
+    })
+
+    await expect(async () => {
+      for await (const _chunk of result.stream) {
+        // consume the stream
+      }
+    }).rejects.toMatchObject({
+      reason: 'budget_exceeded',
+      attempts: 0,
+    })
+
+    expect(stream).not.toHaveBeenCalled()
   })
 
   it('tracks cumulative stream usage without double counting', async () => {

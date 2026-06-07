@@ -6,12 +6,13 @@ import {
   sleep,
 } from './backoff.js'
 import { BudgetTracker } from './budget.js'
-import { CircuitBreaker, CircuitBreakerOpenError } from './circuit-breaker.js'
+import { CircuitBreakerOpenError } from './circuit-breaker.js'
 import { BudgetExceededError, LLMRetryError, ProviderTimeoutError } from './retry.js'
 import type {
   CircuitBreakerLike,
   CostCalculator,
   FallbackDecisionContext,
+  GlobalBudgetLike,
   RetryAttemptContext,
   RetryDecisionContext,
   RetryFailureContext,
@@ -52,6 +53,7 @@ async function* createRetryingStream<TChunk>(
   const {
     maxRetries = 3,
     maxCostUSD,
+    globalBudget,
     costPer1kTokens = 0.002,
     initialDelayMs = 1000,
     maxDelayMs = 30000,
@@ -67,6 +69,8 @@ async function* createRetryingStream<TChunk>(
     onAttempt,
     onRetry,
     onChunk,
+    onChunkError,
+    onChunkErrorMode = 'ignore',
     onSuccess,
     onFailure,
     onBudgetExceeded,
@@ -113,14 +117,15 @@ async function* createRetryingStream<TChunk>(
           throw createAbortError()
         }
 
-        if (budget.isExceeded()) {
+        const exceededBudget = getExceededBudget(budget, globalBudget)
+        if (exceededBudget) {
           budgetExceededNotified = notifyBudgetExceeded(
-            budget.spent,
-            budget.limit,
+            exceededBudget.spent,
+            exceededBudget.limit,
             onBudgetExceeded,
             budgetExceededNotified
           )
-          throw new BudgetExceededError(budget.spent, budget.limit)
+          throw new BudgetExceededError(exceededBudget.spent, exceededBudget.limit)
         }
 
         stats.attempts += 1
@@ -169,21 +174,29 @@ async function* createRetryingStream<TChunk>(
                 defaultCostPer1kTokens: costPer1kTokens,
                 defaultCostCalculator: options.costCalculator,
                 budget,
+                globalBudget,
                 stats,
               })
 
-              if (budget.isExceeded()) {
+              const exceededBudget = getExceededBudget(budget, globalBudget)
+              if (exceededBudget) {
                 budgetExceededNotified = notifyBudgetExceeded(
-                  budget.spent,
-                  budget.limit,
+                  exceededBudget.spent,
+                  exceededBudget.limit,
                   onBudgetExceeded,
                   budgetExceededNotified
                 )
-                throw new BudgetExceededError(budget.spent, budget.limit)
+                throw new BudgetExceededError(exceededBudget.spent, exceededBudget.limit)
               }
             }
 
-            onChunk?.(chunk, context)
+            await runChunkHook({
+              chunk,
+              context,
+              onChunk,
+              onChunkError,
+              onChunkErrorMode,
+            })
             yield chunk
           }
 
@@ -259,7 +272,11 @@ async function* createRetryingStream<TChunk>(
       }
     }
 
-    throw new Error(lastError?.message ?? 'No provider returned a successful stream')
+    if (lastError) {
+      throw lastError
+    }
+
+    throw new Error('No provider returned a successful stream')
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error))
     const retryError = new LLMRetryError(
@@ -302,7 +319,6 @@ function normalizeStreamProviders<TChunk>(
     return options.providers.map((provider) => ({
       ...provider,
       maxRetries: provider.maxRetries ?? defaultMaxRetries,
-      circuitBreaker: normalizeCircuitBreaker(provider.circuitBreaker),
     }))
   }
 
@@ -400,6 +416,7 @@ function trackStreamUsage<TChunk>(options: {
   defaultCostPer1kTokens: number
   defaultCostCalculator?: CostCalculator
   budget: BudgetTracker
+  globalBudget?: GlobalBudgetLike
   stats: StreamRetryStats
 }): void {
   const calculator = options.provider.costCalculator ?? options.defaultCostCalculator
@@ -409,8 +426,52 @@ function trackStreamUsage<TChunk>(options: {
       (options.provider.costPer1kTokens ?? options.defaultCostPer1kTokens)
 
   options.budget.add(options.usage, costUSD)
+  options.globalBudget?.add(costUSD)
   options.stats.totalCostUSD = options.budget.spent
   options.stats.totalTokens = options.budget.tokens
+}
+
+async function runChunkHook<TChunk>(options: {
+  chunk: TChunk
+  context: RetryAttemptContext
+  onChunk?: StreamRetryOptions<TChunk>['onChunk']
+  onChunkError?: StreamRetryOptions<TChunk>['onChunkError']
+  onChunkErrorMode: NonNullable<StreamRetryOptions<TChunk>['onChunkErrorMode']>
+}): Promise<void> {
+  if (!options.onChunk) {
+    return
+  }
+
+  try {
+    await options.onChunk(options.chunk, options.context)
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error))
+
+    try {
+      await options.onChunkError?.(err, options.chunk, options.context)
+    } catch {
+      // Hook error handlers are observability paths; by default they must not break streaming.
+    }
+
+    if (options.onChunkErrorMode === 'throw') {
+      throw err
+    }
+  }
+}
+
+function getExceededBudget(
+  budget: BudgetTracker,
+  globalBudget: GlobalBudgetLike | undefined
+): { spent: number; limit: number | null } | null {
+  if (budget.isExceeded()) {
+    return { spent: budget.spent, limit: budget.limit }
+  }
+
+  if (globalBudget?.isExceeded()) {
+    return { spent: globalBudget.spent, limit: globalBudget.limit }
+  }
+
+  return null
 }
 
 function diffCumulativeUsage(current: TokenUsage, previous: TokenUsage | null): TokenUsage {
@@ -538,20 +599,6 @@ function notifyBudgetExceeded(
   }
 
   return true
-}
-
-function normalizeCircuitBreaker(
-  circuitBreaker: StreamRetryProvider['circuitBreaker']
-): CircuitBreakerLike | undefined {
-  if (!circuitBreaker) {
-    return undefined
-  }
-
-  if ('canRequest' in circuitBreaker) {
-    return circuitBreaker
-  }
-
-  return new CircuitBreaker(circuitBreaker)
 }
 
 function validateStreamOptions(options: {

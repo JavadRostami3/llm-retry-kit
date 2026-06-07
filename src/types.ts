@@ -47,6 +47,38 @@ export interface RetryFailureContext {
   payload?: unknown
 }
 
+export interface HedgeDelayRecord {
+  provider: string
+  providerIndex: number
+  latencyMs: number
+  outcome: 'success' | 'failure'
+  hedged: boolean
+}
+
+export interface HedgeDelayStrategy {
+  getDelayMs: (context: RetryAttemptContext) => number | null | undefined
+  recordLatency: (record: HedgeDelayRecord) => void
+}
+
+export interface AdaptiveHedgeDelayOptions {
+  sampleSize?: number
+  percentile?: number
+  minSamples?: number
+  minDelayMs?: number
+  maxDelayMs?: number
+  defaultDelayMs?: number
+  recordFailures?: boolean
+}
+
+export interface AdaptiveHedgeDelaySnapshot {
+  sampleSize: number
+  percentile: number
+  providers: Record<string, {
+    samples: number
+    delayMs: number | null
+  }>
+}
+
 export type LLMCall<T = unknown> = (
   context: RetryAttemptContext
 ) => Promise<LLMResponse<T>>
@@ -69,7 +101,8 @@ export interface RetryProvider<T = unknown> {
   maxRetries?: number
   timeoutMs?: number
   hedgeDelayMs?: number
-  circuitBreaker?: CircuitBreakerOptions | CircuitBreakerLike
+  hedgeDelayStrategy?: HedgeDelayStrategy
+  circuitBreaker?: CircuitBreakerLike
   costPer1kTokens?: number
   costCalculator?: CostCalculator
 }
@@ -95,18 +128,41 @@ export interface CircuitBreakerLike {
   snapshot?: () => CircuitBreakerSnapshot
 }
 
+export interface GlobalBudgetOptions {
+  maxCostUSD: number
+  windowMs: number
+}
+
+export interface GlobalBudgetSnapshot {
+  spentUSD: number
+  limitUSD: number
+  windowMs: number
+  resetAt: number | null
+  entries: number
+}
+
+export interface GlobalBudgetLike {
+  add: (costUSD: number) => void
+  isExceeded: () => boolean
+  spent: number
+  limit: number
+  snapshot?: () => GlobalBudgetSnapshot
+}
+
 export interface RetryOptions<T = unknown> {
   fn?: LLMCall<T>
   fallback?: LLMCall<T>
   providers?: Array<RetryProvider<T>>
   maxRetries?: number
   maxCostUSD?: number
+  globalBudget?: GlobalBudgetLike
   costPer1kTokens?: number
   costCalculator?: CostCalculator
   initialDelayMs?: number
   maxDelayMs?: number
   timeoutMs?: number
   hedgeDelayMs?: number
+  hedgeDelayStrategy?: HedgeDelayStrategy
   signal?: AbortSignal
   meta?: unknown
   payload?: unknown
@@ -159,7 +215,7 @@ export interface StreamRetryProvider<TChunk = unknown> {
   stream: StreamLLMCall<TChunk>
   maxRetries?: number
   timeoutMs?: number
-  circuitBreaker?: CircuitBreakerOptions | CircuitBreakerLike
+  circuitBreaker?: CircuitBreakerLike
   costPer1kTokens?: number
   costCalculator?: CostCalculator
 }
@@ -170,6 +226,7 @@ export interface StreamRetryOptions<TChunk = unknown> {
   providers?: Array<StreamRetryProvider<TChunk>>
   maxRetries?: number
   maxCostUSD?: number
+  globalBudget?: GlobalBudgetLike
   costPer1kTokens?: number
   costCalculator?: CostCalculator
   initialDelayMs?: number
@@ -190,7 +247,9 @@ export interface StreamRetryOptions<TChunk = unknown> {
     delayMs: number,
     context: RetryDecisionContext
   ) => void
-  onChunk?: (chunk: TChunk, context: RetryAttemptContext) => void
+  onChunk?: (chunk: TChunk, context: RetryAttemptContext) => void | Promise<void>
+  onChunkError?: (error: Error, chunk: TChunk, context: RetryAttemptContext) => void | Promise<void>
+  onChunkErrorMode?: 'ignore' | 'throw'
   onSuccess?: (context: RetrySuccessContext) => void
   onFailure?: (error: Error, context: RetryFailureContext) => void
   onBudgetExceeded?: (spentUSD: number, limitUSD: number) => void

@@ -6,11 +6,12 @@ import {
   sleep,
 } from './backoff.js'
 import { BudgetTracker } from './budget.js'
-import { CircuitBreaker, CircuitBreakerOpenError } from './circuit-breaker.js'
+import { CircuitBreakerOpenError } from './circuit-breaker.js'
 import type {
-  CircuitBreakerLike,
   CostCalculator,
   FallbackDecisionContext,
+  GlobalBudgetLike,
+  HedgeDelayStrategy,
   LLMResponse,
   RetryAttemptContext,
   RetryDecisionContext,
@@ -21,19 +22,25 @@ import type {
   TokenUsage,
 } from './types.js'
 
-type RuntimeRetryProvider<T> = Omit<RetryProvider<T>, 'circuitBreaker'> & {
-  circuitBreaker?: CircuitBreakerLike
+type RuntimeRetryProvider<T> = RetryProvider<T>
+
+const failureAlreadyRecorded = Symbol('llmRetry.failureAlreadyRecorded')
+
+type ErrorWithFailureRecord = Error & {
+  [failureAlreadyRecorded]?: boolean
 }
 
 export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult<T>> {
   const {
     maxRetries = 3,
     maxCostUSD,
+    globalBudget,
     costPer1kTokens = 0.002,
     initialDelayMs = 1000,
     maxDelayMs = 30000,
     timeoutMs,
     hedgeDelayMs,
+    hedgeDelayStrategy,
     signal,
     meta,
     payload,
@@ -88,14 +95,15 @@ export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult
           throw createAbortError()
         }
 
-        if (budget.isExceeded()) {
+        const exceededBudget = getExceededBudget(budget, globalBudget)
+        if (exceededBudget) {
           budgetExceededNotified = notifyBudgetExceeded(
-            budget.spent,
-            budget.limit,
+            exceededBudget.spent,
+            exceededBudget.limit,
             onBudgetExceeded,
             budgetExceededNotified
           )
-          throw new BudgetExceededError(budget.spent, budget.limit)
+          throw new BudgetExceededError(exceededBudget.spent, exceededBudget.limit)
         }
 
         attempts += 1
@@ -128,6 +136,7 @@ export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult
             meta,
             payload,
             hedgeDelayMs,
+            hedgeDelayStrategy,
             nextAttemptNumber: () => {
               attempts += 1
               return attempts
@@ -142,6 +151,7 @@ export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult
             defaultCostPer1kTokens: costPer1kTokens,
             defaultCostCalculator: options.costCalculator,
             budget,
+            globalBudget,
           })
 
           response.provider.circuitBreaker?.recordSuccess()
@@ -164,7 +174,9 @@ export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult
         } catch (error) {
           const err = error instanceof Error ? error : new Error(String(error))
           lastError = err
-          provider.circuitBreaker?.recordFailure()
+          if (!hasFailureAlreadyRecorded(err)) {
+            provider.circuitBreaker?.recordFailure()
+          }
 
           if (providerIndex === 0) {
             primaryError = err
@@ -221,7 +233,11 @@ export async function llmRetry<T>(options: RetryOptions<T>): Promise<RetryResult
       )
     }
 
-    throw new Error(lastError?.message ?? 'No provider returned a successful response')
+    if (lastError) {
+      throw lastError
+    }
+
+    throw new Error('No provider returned a successful response')
   } catch (error) {
     const err = error instanceof Error ? error : new Error(String(error))
     const reason = getFailureReason(err)
@@ -262,7 +278,6 @@ function normalizeProviders<T>(
     return options.providers.map((provider) => ({
       ...provider,
       maxRetries: provider.maxRetries ?? defaultMaxRetries,
-      circuitBreaker: normalizeCircuitBreaker(provider.circuitBreaker),
     }))
   }
 
@@ -329,6 +344,7 @@ async function runProviderAttempt<T>(options: {
   meta?: unknown
   payload?: unknown
   hedgeDelayMs?: number
+  hedgeDelayStrategy?: HedgeDelayStrategy
   nextAttemptNumber: () => number
   onAttempt?: RetryOptions<T>['onAttempt']
 }): Promise<{
@@ -338,7 +354,12 @@ async function runProviderAttempt<T>(options: {
   context: RetryAttemptContext
 }> {
   const provider = options.providers[options.providerIndex]
-  const hedgeDelayMs = provider.hedgeDelayMs ?? options.hedgeDelayMs
+  const hedgeDelayStrategy = provider.hedgeDelayStrategy ?? options.hedgeDelayStrategy
+  const hedgeDelayMs = resolveHedgeDelayMs(
+    provider.hedgeDelayMs ?? options.hedgeDelayMs,
+    hedgeDelayStrategy,
+    options.context
+  )
   const nextProvider = options.providers[options.providerIndex + 1]
 
   if (
@@ -353,15 +374,54 @@ async function runProviderAttempt<T>(options: {
       hedgeProvider: nextProvider,
       hedgeProviderIndex: options.providerIndex + 1,
       hedgeDelayMs,
+      hedgeDelayStrategy,
     })
   }
 
-  return {
-    response: await runWithAbort(provider.fn(options.context), options.attemptSignal.signal),
-    provider,
-    providerIndex: options.providerIndex,
-    context: options.context,
+  const startedAt = Date.now()
+
+  try {
+    const response = await runWithAbort(provider.fn(options.context), options.attemptSignal.signal)
+    hedgeDelayStrategy?.recordLatency({
+      provider: provider.name,
+      providerIndex: options.providerIndex,
+      latencyMs: Date.now() - startedAt,
+      outcome: 'success',
+      hedged: false,
+    })
+
+    return {
+      response,
+      provider,
+      providerIndex: options.providerIndex,
+      context: options.context,
+    }
+  } catch (error) {
+    hedgeDelayStrategy?.recordLatency({
+      provider: provider.name,
+      providerIndex: options.providerIndex,
+      latencyMs: Date.now() - startedAt,
+      outcome: 'failure',
+      hedged: false,
+    })
+
+    throw error
   }
+
+}
+
+function resolveHedgeDelayMs(
+  fixedDelayMs: number | undefined,
+  strategy: HedgeDelayStrategy | undefined,
+  context: RetryAttemptContext
+): number | undefined {
+  const delayMs = fixedDelayMs ?? strategy?.getDelayMs(context)
+
+  if (delayMs === null || delayMs === undefined) {
+    return undefined
+  }
+
+  return Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : undefined
 }
 
 function runHedgedAttempt<T>(options: {
@@ -378,6 +438,7 @@ function runHedgedAttempt<T>(options: {
   lastError: Error | null
   meta?: unknown
   payload?: unknown
+  hedgeDelayStrategy?: HedgeDelayStrategy
   nextAttemptNumber: () => number
   onAttempt?: RetryOptions<T>['onAttempt']
 }): Promise<{
@@ -391,7 +452,9 @@ function runHedgedAttempt<T>(options: {
     let pending = 1
     let hedgeTimeout: ReturnType<typeof setTimeout> | null = null
     let hedgeSignal: AttemptSignal | null = null
-    let lastFailure: Error | null = null
+    let lastFailure: ErrorWithFailureRecord | null = null
+    const primaryStartedAt = Date.now()
+    let hedgeStartedAt = 0
 
     const cleanup = () => {
       if (hedgeTimeout) {
@@ -410,6 +473,16 @@ function runHedgedAttempt<T>(options: {
       if (done) return
       done = true
 
+      options.hedgeDelayStrategy?.recordLatency({
+        provider: result.provider.name,
+        providerIndex: result.providerIndex,
+        latencyMs: Date.now() - (
+          result.providerIndex === options.providerIndex ? primaryStartedAt : hedgeStartedAt
+        ),
+        outcome: 'success',
+        hedged: true,
+      })
+
       if (result.providerIndex === options.providerIndex) {
         hedgeSignal?.abort()
       } else {
@@ -420,11 +493,21 @@ function runHedgedAttempt<T>(options: {
       resolve(result)
     }
 
-    const fail = (error: unknown) => {
+    const fail = (error: unknown, provider: RuntimeRetryProvider<T>) => {
       if (done) return
 
-      const err = error instanceof Error ? error : new Error(String(error))
+      const err = markFailureAlreadyRecorded(
+        error instanceof Error ? error : new Error(String(error))
+      )
       lastFailure = err
+      options.hedgeDelayStrategy?.recordLatency({
+        provider: provider.name,
+        providerIndex: provider === options.provider ? options.providerIndex : options.hedgeProviderIndex,
+        latencyMs: Date.now() - (provider === options.provider ? primaryStartedAt : hedgeStartedAt),
+        outcome: 'failure',
+        hedged: true,
+      })
+      provider.circuitBreaker?.recordFailure()
       pending -= 1
 
       if (pending === 0) {
@@ -441,13 +524,14 @@ function runHedgedAttempt<T>(options: {
         providerIndex: options.providerIndex,
         context: options.context,
       }),
-      (error) => fail(error)
+      (error) => fail(error, options.provider)
     )
 
     hedgeTimeout = setTimeout(() => {
       if (done) return
 
       pending += 1
+      hedgeStartedAt = Date.now()
       hedgeSignal = createAttemptSignal(
         options.runtimeSignal,
         options.hedgeProvider.timeoutMs
@@ -474,10 +558,20 @@ function runHedgedAttempt<T>(options: {
           providerIndex: options.hedgeProviderIndex,
           context: hedgeContext,
         }),
-        (error) => fail(error)
+        (error) => fail(error, options.hedgeProvider)
       )
     }, options.hedgeDelayMs)
   })
+}
+
+function markFailureAlreadyRecorded(error: Error): ErrorWithFailureRecord {
+  const err = error as ErrorWithFailureRecord
+  err[failureAlreadyRecorded] = true
+  return err
+}
+
+function hasFailureAlreadyRecorded(error: Error): boolean {
+  return Boolean((error as ErrorWithFailureRecord)[failureAlreadyRecorded])
 }
 
 async function shouldRetryAttempt(options: {
@@ -534,6 +628,7 @@ function trackUsage<T>(options: {
   defaultCostPer1kTokens: number
   defaultCostCalculator?: CostCalculator
   budget: BudgetTracker
+  globalBudget?: GlobalBudgetLike
 }): number {
   const usage = options.response.usage
   if (!usage) {
@@ -546,8 +641,24 @@ function trackUsage<T>(options: {
     : calculateDefaultCost(usage, options.provider.costPer1kTokens ?? options.defaultCostPer1kTokens)
 
   options.budget.add(usage, costUSD)
+  options.globalBudget?.add(costUSD)
 
   return costUSD
+}
+
+function getExceededBudget(
+  budget: BudgetTracker,
+  globalBudget: GlobalBudgetLike | undefined
+): { spent: number; limit: number | null } | null {
+  if (budget.isExceeded()) {
+    return { spent: budget.spent, limit: budget.limit }
+  }
+
+  if (globalBudget?.isExceeded()) {
+    return { spent: globalBudget.spent, limit: globalBudget.limit }
+  }
+
+  return null
 }
 
 function calculateDefaultCost(usage: TokenUsage, costPer1kTokens: number): number {
@@ -739,18 +850,4 @@ function validateProviders<T>(providers: Array<RuntimeRetryProvider<T>>): void {
       throw new Error(`hedgeDelayMs for provider "${provider.name}" must be greater than or equal to 0`)
     }
   })
-}
-
-function normalizeCircuitBreaker(
-  circuitBreaker: RetryProvider['circuitBreaker']
-): CircuitBreakerLike | undefined {
-  if (!circuitBreaker) {
-    return undefined
-  }
-
-  if ('canRequest' in circuitBreaker) {
-    return circuitBreaker
-  }
-
-  return new CircuitBreaker(circuitBreaker)
 }

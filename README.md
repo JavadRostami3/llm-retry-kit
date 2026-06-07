@@ -9,9 +9,9 @@
 
 Small resilience layer for production LLM calls. `llm-retry-kit` gives you
 provider-aware retries, fallback chains, jittered exponential backoff,
-`Retry-After` handling, streaming retries, circuit breakers, hedged requests,
-budget tracking, cancellation, timeouts, and observability hooks without
-runtime dependencies.
+`Retry-After` handling, streaming retries, circuit breakers, adaptive hedged
+requests, rolling budget windows, cancellation, timeouts, and observability
+hooks without runtime dependencies.
 
 ```bash
 npm install llm-retry-kit
@@ -48,6 +48,9 @@ and `llm-retry-kit` manages the reliability policy around it.
 - Skip unhealthy providers with `CircuitBreaker`.
 - Set timeout budgets per provider/model.
 - Start hedged requests to reduce tail latency.
+- Adapt hedge delays from recent provider latency with `AdaptiveHedgeDelay`.
+- Enforce rolling cost windows with `GlobalBudgetTracker`.
+- Await async stream chunk hooks while protecting the stream from hook errors.
 - Pass request `meta` and `payload` through every context for logging.
 - Abort long calls and retry sleeps with `AbortSignal` or `timeoutMs`.
 - Observe attempts, retries, success, failure, and budget events.
@@ -226,9 +229,10 @@ console.log(result.getStats())
 
 ### Circuit Breaker
 
-Keep one `CircuitBreaker` instance per provider/model at application scope. If
-the failure threshold is reached inside the time window, later calls skip that
-provider until the cooldown expires.
+Keep one `CircuitBreaker` instance per provider/model at application scope. Do
+not create the breaker inline inside a request handler; its state must survive
+between calls. If the failure threshold is reached inside the time window,
+later calls skip that provider until the cooldown expires.
 
 ```ts
 import { CircuitBreaker, llmRetry } from 'llm-retry-kit'
@@ -287,6 +291,62 @@ await llmRetry({
 
 Hedging is best for latency-sensitive read paths. It can increase provider
 traffic, so pair it with budget tracking and conservative delay values.
+
+### Adaptive Hedging
+
+Use `AdaptiveHedgeDelay` when fixed hedge delays are too brittle. It records
+recent latency samples per provider and uses the configured percentile as the
+next hedge delay. Keep the instance at application scope so the latency history
+survives between requests.
+
+```ts
+import { AdaptiveHedgeDelay, llmRetry } from 'llm-retry-kit'
+
+const adaptiveHedge = new AdaptiveHedgeDelay({
+  sampleSize: 100,
+  percentile: 0.95,
+  minSamples: 10,
+  minDelayMs: 250,
+  maxDelayMs: 5_000,
+})
+
+await llmRetry({
+  providers: [
+    { name: 'openai:gpt-4o-mini', fn: callOpenAI },
+    { name: 'anthropic:claude-sonnet', fn: callAnthropic },
+  ],
+  hedgeDelayStrategy: adaptiveHedge,
+})
+```
+
+If there are not enough samples yet, no hedge is fired unless you set
+`defaultDelayMs`.
+
+### Rolling Global Budget
+
+`maxCostUSD` limits a single retry workflow. `GlobalBudgetTracker` limits the
+total spend across many calls inside a rolling time window. Keep one instance at
+application scope.
+
+```ts
+import { GlobalBudgetTracker, llmRetry } from 'llm-retry-kit'
+
+const globalBudget = new GlobalBudgetTracker({
+  maxCostUSD: 5,
+  windowMs: 60_000,
+})
+
+await llmRetry({
+  fn: callModel,
+  globalBudget,
+  costCalculator: calculateRealProviderCost,
+})
+```
+
+When the rolling window is exhausted, new attempts fail before the provider is
+called. In-flight non-streaming calls can still finish because final usage is
+known only after the provider returns. Streaming calls are checked as chunk
+usage is reported.
 
 ### Metadata And Payload Tracking
 
@@ -452,12 +512,14 @@ await llmRetry({
 | `providers` | `RetryProvider<T>[]` | optional | Explicit provider/model chain. |
 | `maxRetries` | `number` | `3` | Retries after the first attempt. |
 | `maxCostUSD` | `number` | optional | Maximum tracked cost before later attempts stop. |
+| `globalBudget` | `GlobalBudgetTracker` | optional | Shared rolling cost budget across calls. |
 | `costPer1kTokens` | `number` | `0.002` | Simple cost estimate. |
 | `costCalculator` | `(usage, context) => number` | optional | Custom cost calculation. |
 | `initialDelayMs` | `number` | `1000` | Initial retry delay. |
 | `maxDelayMs` | `number` | `30000` | Maximum retry delay. |
 | `timeoutMs` | `number` | optional | Abort wrapper after this time. |
 | `hedgeDelayMs` | `number` | optional | Start the next provider after this delay if the current provider is still pending. |
+| `hedgeDelayStrategy` | `AdaptiveHedgeDelay` | optional | Compute hedge delay from recent provider latency. |
 | `signal` | `AbortSignal` | optional | External cancellation signal. |
 | `meta` | `unknown` | optional | User metadata copied into attempt/failure contexts. |
 | `payload` | `unknown` | optional | Request payload copied into attempt/failure contexts. |
@@ -478,7 +540,8 @@ await llmRetry({
   maxRetries?: number
   timeoutMs?: number
   hedgeDelayMs?: number
-  circuitBreaker?: CircuitBreaker | CircuitBreakerOptions
+  hedgeDelayStrategy?: AdaptiveHedgeDelay
+  circuitBreaker?: CircuitBreaker
   costPer1kTokens?: number
   costCalculator?: (usage, context) => number
 }
@@ -499,8 +562,12 @@ iterable is consumed.
 | `chunkUsageMode` | `'delta' \| 'cumulative'` | `'delta'` | Interpret chunk usage as incremental or cumulative. |
 | `maxRetries` | `number` | `3` | Retries after the first attempt. |
 | `timeoutMs` | `number` | optional | Abort the whole stream workflow after this time. |
+| `globalBudget` | `GlobalBudgetTracker` | optional | Shared rolling cost budget across calls. |
 | `meta` | `unknown` | optional | User metadata copied into contexts. |
 | `payload` | `unknown` | optional | Request payload copied into contexts. |
+| `onChunk` | `(chunk, context) => void \| Promise<void>` | optional | Called for each chunk before it is yielded. |
+| `onChunkError` | `(error, chunk, context) => void \| Promise<void>` | optional | Called when `onChunk` fails. |
+| `onChunkErrorMode` | `'ignore' \| 'throw'` | `'ignore'` | Decide whether `onChunk` failures should break the stream. |
 
 ### `CircuitBreaker`
 
@@ -514,6 +581,32 @@ new CircuitBreaker({
 
 `snapshot()` returns `{ state, failures, openedAt }`, where state is
 `'closed'`, `'open'`, or `'half_open'`.
+
+### `AdaptiveHedgeDelay`
+
+```ts
+new AdaptiveHedgeDelay({
+  sampleSize: 100,
+  percentile: 0.95,
+  minSamples: 5,
+  minDelayMs: 250,
+  maxDelayMs: 5_000,
+  defaultDelayMs: 750,
+})
+```
+
+`snapshot()` returns the current sample count and computed delay per provider.
+
+### `GlobalBudgetTracker`
+
+```ts
+new GlobalBudgetTracker({
+  maxCostUSD: 5,
+  windowMs: 60_000,
+})
+```
+
+`snapshot()` returns `{ spentUSD, limitUSD, windowMs, resetAt, entries }`.
 
 ### `RetryResult<T>`
 
@@ -552,6 +645,7 @@ new CircuitBreaker({
 | `maxDelayMs` | `30000` |
 | `costPer1kTokens` | `0.002` |
 | stream retry mode | `before-first-chunk` |
+| stream chunk hook error mode | `ignore` |
 | fallback on client errors | `false` |
 | fallback on transient errors | `true` |
 | runtime dependencies | none |
